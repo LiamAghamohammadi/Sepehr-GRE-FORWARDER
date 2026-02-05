@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
-
 set +e
 set +u
 export LC_ALL=C
 LOG_LINES=()
 LOG_MIN=3
 LOG_MAX=10
-
 banner() {
   cat <<'EOF'
 ╔═════════════════════════════════════════════════════╗
