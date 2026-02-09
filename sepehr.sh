@@ -327,7 +327,7 @@ After=network-online.target gre${id}.service
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/bin/socat TCP-LISTEN:${port},reuseaddr,fork TCP:${target_ip}:${port}
+ExecStart=/usr/bin/socat TCP4-LISTEN:${port},reuseaddr,fork TCP4:${target_ip}:${port}
 Restart=always
 RestartSec=2
 
