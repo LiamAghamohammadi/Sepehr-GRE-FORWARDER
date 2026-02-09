@@ -262,7 +262,6 @@ stop_disable() {
 show_unit_status_brief() {
   systemctl --no-pager --full status "$1" 2>&1 | sed -n '1,12p'
 }
-
 make_gre_service() {
   local id="$1" local_ip="$2" remote_ip="$3" local_gre_ip="$4" key="$5" mtu="${6:-}"
   local unit="gre${id}.service"
@@ -278,7 +277,11 @@ make_gre_service() {
 
   local mtu_line=""
   if [[ -n "$mtu" ]]; then
-    mtu_line="ExecStart=/sbin/ip link set gre${id} mtu ${mtu}"
+    if valid_mtu "$mtu"; then
+      mtu_line="ExecStart=/sbin/ip link set gre${id} mtu ${mtu}"
+    else
+      add_log "WARNING: Invalid MTU '$mtu' ignored."
+    fi
   fi
 
   cat >"$path" <<EOF
@@ -291,7 +294,7 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/bin/bash -c "/sbin/ip tunnel del gre${id} 2>/dev/null || true"
-ExecStart=/sbin/ip tunnel add gre${id} mode gre local ${local_ip} remote ${remote_ip} ttl 255 key ${key}
+ExecStart=/sbin/ip tunnel add gre${id} mode gre local ${local_ip} remote ${remote_ip} key ${key} nopmtudisc
 ExecStart=/sbin/ip addr add ${local_gre_ip}/30 dev gre${id}
 ${mtu_line}
 ExecStart=/sbin/ip link set gre${id} up
@@ -337,6 +340,100 @@ EOF
 
   [[ $? -eq 0 ]] && add_log "Forwarder created: fw-gre${id}-${port}" || add_log "Failed writing forwarder: $unit"
 }
+
+
+ensure_mss_clamp_for_gre() {
+  local dev="$1"
+  local mode="${2:-clamp}"
+  local mss="${3:-}"
+
+  command -v iptables >/dev/null 2>&1 || { add_log "iptables not found; skip MSS clamp"; return 0; }
+
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
+  sysctl -w "net.ipv4.conf.${dev}.rp_filter=0" >/dev/null 2>&1 || true
+
+  local rule_out=()
+  local rule_in=()
+
+  if [[ "$mode" == "set" && -n "$mss" ]]; then
+    rule_out=(-t mangle -A FORWARD -o "$dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss")
+    rule_in=(-t mangle -A FORWARD -i "$dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$mss")
+  else
+    rule_out=(-t mangle -A FORWARD -o "$dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu)
+    rule_in=(-t mangle -A FORWARD -i "$dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu)
+  fi
+
+  if iptables -t mangle -C FORWARD -o "$dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS \
+      $( [[ "$mode" == "set" && -n "$mss" ]] && echo "--set-mss $mss" || echo "--clamp-mss-to-pmtu" ) \
+      >/dev/null 2>&1; then
+    add_log "MSS clamp rule (OUT) already exists for $dev"
+  else
+    iptables "${rule_out[@]}" >/dev/null 2>&1 && add_log "MSS rule added (OUT) for $dev" || add_log "WARNING: failed add MSS rule (OUT) for $dev"
+  fi
+
+  if iptables -t mangle -C FORWARD -i "$dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS \
+      $( [[ "$mode" == "set" && -n "$mss" ]] && echo "--set-mss $mss" || echo "--clamp-mss-to-pmtu" ) \
+      >/dev/null 2>&1; then
+    add_log "MSS clamp rule (IN) already exists for $dev"
+  else
+    iptables "${rule_in[@]}" >/dev/null 2>&1 && add_log "MSS rule added (IN) for $dev" || add_log "WARNING: failed add MSS rule (IN) for $dev"
+  fi
+}
+
+create_gre_rule_unit() {
+  local id="$1"
+  local dev="gre${id}"
+  local rule_script="/usr/local/bin/${dev}-rules.sh"
+  local unit="/etc/systemd/system/${dev}-rule.service"
+
+  add_log "Creating MSS clamp rule unit: ${dev}-rule.service"
+  render
+
+  cat >"$rule_script" <<'EOS'
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEV="${1:?missing dev}"
+
+command -v iptables >/dev/null 2>&1 || exit 0
+
+modprobe xt_TCPMSS >/dev/null 2>&1 || true
+
+iptables -t mangle -C FORWARD -o "$DEV" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 \
+  || iptables -t mangle -A FORWARD -o "$DEV" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+iptables -t mangle -C FORWARD -i "$DEV" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 \
+  || iptables -t mangle -A FORWARD -i "$DEV" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+exit 0
+EOS
+
+  chmod +x "$rule_script"
+
+  cat >"$unit" <<EOF
+[Unit]
+Description=Apply MSS clamp rules for ${dev}
+After=${dev}.service network-online.target
+Wants=${dev}.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${rule_script} ${dev}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now "${dev}-rule.service" >/dev/null 2>&1 || true
+
+  add_log "Enabled: ${dev}-rule.service (runs after ${dev}.service)"
+}
+
+
 iran_setup() {
   local ID IRANIP KHAREJIP GREBASE
   local -a PORT_LIST=()
@@ -354,7 +451,7 @@ iran_setup() {
     use_mtu="$(trim "$use_mtu")"
     case "${use_mtu,,}" in
       y|yes)
-        ask_until_valid "input your custom mtu for gre (576-9000):" valid_mtu MTU_VALUE
+        ask_until_valid "input your custom mtu for gre (576-1600):" valid_mtu MTU_VALUE
         break
         ;;
       n|no|"")
@@ -391,6 +488,8 @@ iran_setup() {
 
   add_log "Starting gre${ID} + forwarders..."
   enable_now "gre${ID}.service"
+  ensure_mss_clamp_for_gre "gre${ID}" "clamp"
+  create_gre_rule_unit "$ID"  
   for p in "${PORT_LIST[@]}"; do
     enable_now "fw-gre${ID}-${p}.service"
   done
@@ -424,7 +523,7 @@ kharej_setup() {
     use_mtu="$(trim "$use_mtu")"
     case "${use_mtu,,}" in
       y|yes)
-        ask_until_valid "input your custom mtu for gre (576-9000):" valid_mtu MTU_VALUE
+        ask_until_valid "input your custom mtu for gre (576-1600):" valid_mtu MTU_VALUE
         break
         ;;
       n|no|"")
@@ -710,6 +809,10 @@ uninstall_clean() {
   add_log "Removing unit files..."
   rm -f "/etc/systemd/system/gre${id}.service" >/dev/null 2>&1 || true
   rm -f /etc/systemd/system/fw-gre${id}-*.service >/dev/null 2>&1 || true
+  systemctl stop "gre${id}-rule.service" >/dev/null 2>&1 || true
+  systemctl disable "gre${id}-rule.service" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/gre${id}-rule.service" >/dev/null 2>&1 || true
+  rm -f "/usr/local/bin/gre${id}-rules.sh" >/dev/null 2>&1 || true
 
   add_log "Reloading systemd..."
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -1006,13 +1109,32 @@ if [[ "\$SIDE" == "IRAN" ]]; then
     sed -i.bak -E "s/TCP:[0-9.]+:/TCP:\${new_ip}:/" "\$fw"
   done
 fi
-
+systemctl stop "gre\${ID}.service"
+systemctl disable "gre\${ID}.service"
+ip link set "gre\${ID}" down 2>/dev/null || true
+ip addr flush dev "gre\${ID}" 2>/dev/null || true
+ip tunnel del "gre\${ID}" 2>/dev/null || true
+ip route flush cache 2>/dev/null || true
+sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf."gre\${ID}".rp_filter=0 >/dev/null 2>&1 || true
 systemctl daemon-reload
+systemctl enable "gre\${ID}.service"
 systemctl restart "gre\${ID}.service"
 
+
 if [[ "\$SIDE" == "IRAN" ]]; then
-  systemctl restart fw-gre\${ID}-*.service || true
+  if systemctl list-unit-files --no-legend "gre\${ID}-rule.service" 2>/dev/null | grep -q "gre\${ID}-rule.service"; then
+    systemctl restart "gre\${ID}-rule.service" >/dev/null 2>&1 || true
+  else
+    log "WARN: gre\${ID}-rule.service not found; rules may not be applied"
+  fi
+  for fw_unit in /etc/systemd/system/fw-gre\${ID}-*.service; do
+    [[ -f "\$fw_unit" ]] || continue
+    systemctl restart "\$(basename "\$fw_unit")" >/dev/null 2>&1 || true
+  done
 fi
+
 
 PORTS=""
 if [[ "\$SIDE" == "IRAN" ]]; then
@@ -1045,6 +1167,29 @@ EOF
   pause_enter
 }
 
+automation_script_path() {
+  local id="$1"
+  echo "/usr/local/bin/sepehr-recreate-gre${id}.sh"
+}
+
+automation_log_path() {
+  local id="$1"
+  echo "/var/log/sepehr-gre${id}.log"
+}
+
+remove_gre_automation_cron() {
+  local id="$1"
+  local script
+  script="$(automation_script_path "$id")"
+
+  crontab -l >/dev/null 2>&1 || return 0
+
+  local tmp
+  tmp="$(mktemp)"
+  crontab -l 2>/dev/null | grep -vF "$script" > "$tmp" || true
+  crontab "$tmp" 2>/dev/null || true
+  rm -f "$tmp" >/dev/null 2>&1 || true
+}
 automation_backup_dir() {
   echo "/root/gre-backup"
 }
@@ -1179,7 +1324,13 @@ fi
 
 systemctl stop "gre\${ID}.service" >/dev/null 2>&1 || true
 systemctl disable "gre\${ID}.service" >/dev/null 2>&1 || true
-
+ip link set "gre\${ID}" down 2>/dev/null || true
+ip addr flush dev "gre\${ID}" 2>/dev/null || true
+ip tunnel del "gre\${ID}" 2>/dev/null || true
+ip route flush cache 2>/dev/null || true
+sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf."gre\${ID}".rp_filter=0 >/dev/null 2>&1 || true
 if [[ "\$SIDE" == "IRAN" ]]; then
   while IFS= read -r fw_path; do
     [[ -n "\$fw_path" ]] || continue
@@ -1218,6 +1369,11 @@ systemctl daemon-reload >/dev/null 2>&1 || true
 systemctl enable --now "gre\${ID}.service" >/dev/null 2>&1 || true
 
 if [[ "\$SIDE" == "IRAN" ]]; then
+  if systemctl list-unit-files --no-legend "gre\${ID}-rule.service" 2>/dev/null | grep -q "gre\${ID}-rule.service"; then
+    systemctl restart "gre\${ID}-rule.service" >/dev/null 2>&1 || true
+  else
+    log "WARN: gre\${ID}-rule.service not found; rules may not be applied"
+  fi
   for fw_unit in /etc/systemd/system/fw-gre\${ID}-*.service; do
     [[ -f "\$fw_unit" ]] || continue
     systemctl enable --now "\$(basename "\$fw_unit")" >/dev/null 2>&1 || true
@@ -1257,7 +1413,7 @@ change_mtu() {
   fi
   id="${GRE_IDS[$MENU_SELECTED]}"
 
-  ask_until_valid "input your new mtu for gre (576-9000):" valid_mtu mtu
+  ask_until_valid "input your new mtu for gre (576-1600):" valid_mtu mtu
 
   add_log "Setting MTU on interface gre${id} to ${mtu}..."
   render
