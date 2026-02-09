@@ -727,8 +727,6 @@ uninstall_clean() {
     conntrack -D -o "gre${id}" >/dev/null 2>&1 || true
   fi
 
-  sleep 1
-
   add_log "Removing unit files, drop-ins, and all autostart symlinks..."
 
   rm -f "/etc/systemd/system/gre${id}.service" >/dev/null 2>&1 || true
@@ -1070,8 +1068,6 @@ if command -v conntrack >/dev/null 2>&1; then
   conntrack -D -i "gre${ID}" >/dev/null 2>&1 || true
   conntrack -D -o "gre${ID}" >/dev/null 2>&1 || true
 fi
-
-sleep 1
 
 
 sed -i.bak -E "s/ip addr add [0-9.]+\/30/ip addr add ${new_ip}\/30/" "$UNIT"
